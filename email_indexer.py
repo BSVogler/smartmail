@@ -33,11 +33,15 @@ class EmailIndexer:
             raise ValueError("Please set IMAP_SERVER, EMAIL_ADDRESS, and EMAIL_PASSWORD environment variables")
         
         self.local_model_name = os.getenv('LOCAL_EMBEDDING_MODEL', 'BAAI/bge-small-en-v1.5')
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=self.local_model_name,
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
-        )
+        
+        print(f"Configuration:")
+        print(f"  IMAP Server: {self.imap_server}:{self.imap_port}")
+        print(f"  Email: {self.email_address}")
+        print(f"  Infinity URL: {self.infinity_url} (optional)")
+        print(f"  Local fallback model: {self.local_model_name} (loaded only if needed)")
+        
+        # Don't load local embeddings yet - only if needed
+        self.embeddings = None
         
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=500,
@@ -62,17 +66,25 @@ class EmailIndexer:
         self.cluster_labels = None
     
     def check_infinity_server(self) -> bool:
-        """Check if Infinity server is available"""
+        """Check if Infinity server is available (does not launch server)"""
         try:
             print(f"Checking Infinity server at {self.infinity_url}...")
-            response = requests.get(f"{self.infinity_url}/models", timeout=2)
+            response = requests.get(f"{self.infinity_url}/models", timeout=3)
             if response.status_code == 200:
                 print(f"✓ Infinity server is online at {self.infinity_url}")
                 return True
-        except:
-            pass
-        print(f"✗ Infinity server not available, will use local embeddings")
-        return False
+            else:
+                print(f"✗ Infinity server responded with status {response.status_code}")
+                return False
+        except requests.exceptions.ConnectionError:
+            print(f"✗ Infinity server not reachable at {self.infinity_url}")
+            return False
+        except requests.exceptions.Timeout:
+            print(f"✗ Infinity server timeout at {self.infinity_url}")
+            return False
+        except Exception as e:
+            print(f"✗ Error checking Infinity server: {e}")
+            return False
         
     def connect_imap(self):
         """Connect to IMAP server and login"""
@@ -262,9 +274,10 @@ class EmailIndexer:
     def get_embeddings_infinity(self, texts: List[str]) -> np.ndarray:
         """Get embeddings from Infinity server"""
         if not self.infinity_available:
+            print("Infinity server not available, falling back to local embeddings")
             return self.get_embeddings_local(texts)
             
-        print(f"Generating embeddings using Infinity server at {self.infinity_url}...")
+        print(f"✓ Generating embeddings using Infinity server at {self.infinity_url}...")
         
         try:
             url = f"{self.infinity_url}/embeddings"
@@ -308,7 +321,19 @@ class EmailIndexer:
     
     def get_embeddings_local(self, texts: List[str]) -> np.ndarray:
         """Fallback: Get embeddings using local model"""
-        print("Generating embeddings using local model...")
+        
+        # Lazy load the local model only when needed
+        if self.embeddings is None:
+            print(f"Loading local embedding model: {self.local_model_name}")
+            print("Note: This will download the model if not cached locally")
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=self.local_model_name,
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+            print("✓ Local embedding model loaded successfully")
+        
+        print(f"✓ Generating embeddings using local model: {self.local_model_name}")
         embeddings = []
         
         batch_size = 32

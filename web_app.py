@@ -7,6 +7,8 @@ from fastapi.templating import Jinja2Templates
 import uvicorn
 from email_indexer import EmailIndexer
 import os
+import platform
+import subprocess
 from typing import AsyncGenerator
 from contextlib import asynccontextmanager
 import logging
@@ -22,6 +24,227 @@ logger = logging.getLogger(__name__)
 
 # Global indexer instance
 indexer = None
+
+def is_macos():
+    """Check if running on macOS"""
+    return platform.system() == 'Darwin'
+
+def has_apple_mail():
+    """Check if Apple Mail is available by looking for Mail directory"""
+    if not is_macos():
+        logger.info("Not running on macOS")
+        return False
+    
+    # Check for Mail directory in user's Library
+    home_dir = os.path.expanduser('~')
+    mail_dir = os.path.join(home_dir, 'Library', 'Mail')
+    exists = os.path.exists(mail_dir)
+    
+    if exists:
+        logger.info(f"Apple Mail directory found at: {mail_dir}")
+        # Test if we can actually access the directory
+        try:
+            subdirs = [d for d in os.listdir(mail_dir) if os.path.isdir(os.path.join(mail_dir, d))]
+            logger.info(f"Mail subdirectories: {subdirs}")
+            return True
+        except PermissionError as e:
+            logger.error(f"Permission denied accessing Mail directory: {e}")
+            logger.error("macOS privacy settings prevent access to Mail data")
+            logger.error("The application needs 'Full Disk Access' permission in System Preferences > Privacy & Security")
+            return False
+        except Exception as e:
+            logger.warning(f"Could not list Mail directory contents: {e}")
+            return False
+    else:
+        logger.info(f"Apple Mail directory not found at: {mail_dir}")
+        return False
+
+def get_system_info():
+    """Get system information for frontend"""
+    is_mac = is_macos()
+    has_mail = has_apple_mail()
+    
+    # Detect permission issue
+    permission_issue = False
+    if is_mac:
+        home_dir = os.path.expanduser('~')
+        mail_dir = os.path.join(home_dir, 'Library', 'Mail')
+        if os.path.exists(mail_dir):
+            try:
+                os.listdir(mail_dir)
+            except PermissionError:
+                permission_issue = True
+    
+    return {
+        "is_macos": is_mac,
+        "has_apple_mail": has_mail,
+        "can_open_local_emails": is_mac and has_mail,
+        "permission_issue": permission_issue,
+        "platform": platform.system(),
+        "mail_access_note": "Requires 'Full Disk Access' permission" if permission_issue else None
+    }
+
+def find_email_file_by_id(email_id):
+    """Find .emlx file in Apple Mail directories by email ID"""
+    if not has_apple_mail():
+        return None
+    
+    home_dir = os.path.expanduser('~')
+    mail_dir = os.path.join(home_dir, 'Library', 'Mail')
+    
+    logger.info(f"Searching for email ID '{email_id}' in {mail_dir}")
+    
+    # Search through all version directories (V2, V3, V7, V10, etc.)
+    files_checked = 0
+    for root, dirs, files in os.walk(mail_dir):
+        # Skip certain directories that don't contain emails
+        if any(skip_dir in root for skip_dir in ['MailData', 'Envelope Index', 'Mailboxes']):
+            continue
+            
+        for file in files:
+            if file.endswith('.emlx'):
+                file_path = os.path.join(root, file)
+                files_checked += 1
+                
+                try:
+                    # Read the .emlx file and check for matching email ID
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read(16384)  # Read first 16KB for better matching
+                        
+                        # Try multiple matching strategies
+                        match_patterns = [
+                            f'Message-ID: <{email_id}>',
+                            f'Message-ID:<{email_id}>',
+                            f'Message-Id: <{email_id}>',
+                            f'message-id: <{email_id}>',
+                            email_id
+                        ]
+                        
+                        for pattern in match_patterns:
+                            if pattern in content:
+                                logger.info(f"Found email file: {file_path} (matched pattern: {pattern})")
+                                return file_path
+                            
+                except Exception as e:
+                    # Skip files that can't be read
+                    logger.debug(f"Could not read file {file_path}: {e}")
+                    continue
+                    
+                # Log progress every 100 files
+                if files_checked % 100 == 0:
+                    logger.info(f"Checked {files_checked} .emlx files so far...")
+    
+    logger.warning(f"Email file not found for ID: {email_id} after checking {files_checked} files")
+    
+    # Try alternative approach: search by subject or sender if available
+    if indexer and indexer.chunk_metadata:
+        for meta in indexer.chunk_metadata:
+            if meta['email_id'] == email_id:
+                subject = meta.get('subject', '').strip()
+                sender = meta.get('from', '').strip()
+                logger.info(f"Trying alternative search by subject: '{subject}' and sender: '{sender}'")
+                return find_email_file_by_content(subject, sender)
+    
+    return None
+
+def find_email_file_by_content(subject, sender):
+    """Fallback: Find .emlx file by subject and sender"""
+    if not has_apple_mail() or not subject:
+        return None
+    
+    home_dir = os.path.expanduser('~')
+    mail_dir = os.path.join(home_dir, 'Library', 'Mail')
+    
+    # Clean subject for matching (remove Re:, Fwd: etc.)
+    clean_subject = subject.lower()
+    for prefix in ['re:', 'fwd:', 'fw:', 'forward:', 're[']:
+        clean_subject = clean_subject.replace(prefix, '').strip()
+    
+    for root, dirs, files in os.walk(mail_dir):
+        if any(skip_dir in root for skip_dir in ['MailData', 'Envelope Index', 'Mailboxes']):
+            continue
+            
+        for file in files:
+            if file.endswith('.emlx'):
+                file_path = os.path.join(root, file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read(16384)
+                        
+                        # Check for subject match
+                        if clean_subject in content.lower() and len(clean_subject) > 5:
+                            # Also check sender if available
+                            if not sender or sender.lower() in content.lower():
+                                logger.info(f"Found email file by content: {file_path}")
+                                return file_path
+                                
+                except Exception as e:
+                    continue
+    
+    return None
+
+def open_privacy_settings():
+    """Open macOS Privacy & Security settings"""
+    try:
+        # Open Privacy & Security settings directly
+        subprocess.run(['open', 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'], check=True)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to open privacy settings: {e}")
+        try:
+            # Fallback: open general System Preferences
+            subprocess.run(['open', '/System/Applications/System Preferences.app'], check=True)
+            return True
+        except Exception as e2:
+            logger.error(f"Failed to open System Preferences: {e2}")
+            return False
+
+def open_email_in_apple_mail(email_id):
+    """Open email in Apple Mail by finding and opening the .emlx file"""
+    logger.info(f"=== Starting Apple Mail integration for email ID: {email_id} ===")
+    
+    if not has_apple_mail():
+        logger.error("Apple Mail not available")
+        return {"success": False, "message": "Apple Mail not available"}
+    
+    logger.info("Apple Mail is available, searching for email file...")
+    email_file = find_email_file_by_id(email_id)
+    
+    if not email_file:
+        logger.error(f"Email file not found for ID: {email_id}")
+        
+        # Add debug info about what email metadata we have
+        if indexer and indexer.chunk_metadata:
+            matching_metadata = [meta for meta in indexer.chunk_metadata if meta['email_id'] == email_id]
+            if matching_metadata:
+                meta = matching_metadata[0]
+                logger.info(f"Found metadata for email {email_id}:")
+                logger.info(f"  Subject: {meta.get('subject')}")
+                logger.info(f"  From: {meta.get('from')}")
+                logger.info(f"  Date: {meta.get('date')}")
+            else:
+                logger.error(f"No metadata found for email ID: {email_id}")
+                logger.info(f"Available email IDs: {[meta['email_id'] for meta in indexer.chunk_metadata[:10]]}")
+        
+        return {"success": False, "message": "Email file not found in Apple Mail storage"}
+    
+    logger.info(f"Found email file: {email_file}")
+    
+    try:
+        # Use subprocess to open the .emlx file (macOS will open it in Apple Mail)
+        logger.info(f"Executing: open '{email_file}'")
+        result = subprocess.run(['open', email_file], check=True, capture_output=True, text=True)
+        logger.info(f"Successfully opened email file in Apple Mail: {email_file}")
+        logger.info(f"Subprocess stdout: {result.stdout}")
+        logger.info(f"Subprocess stderr: {result.stderr}")
+        return {"success": True, "message": "Email opened in Apple Mail"}
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to open email file: {e}")
+        logger.error(f"Return code: {e.returncode}")
+        logger.error(f"Stdout: {e.stdout}")
+        logger.error(f"Stderr: {e.stderr}")
+        return {"success": False, "message": f"Failed to open email: {str(e)}"}
 
 def convert_numpy_types(obj):
     """Convert numpy types to native Python types for JSON serialization"""
@@ -90,6 +313,11 @@ async def global_exception_handler(request: Request, exc: Exception):
             "type": type(exc).__name__
         }
     )
+
+@app.get("/api/system-info")
+async def get_system_info_endpoint():
+    """Get system information and capabilities"""
+    return get_system_info()
 
 @app.get("/api/status")
 async def get_status():
@@ -451,6 +679,45 @@ async def get_email_content(email_id: str):
         "is_unread": email_metadata.get('is_unread', False),
         "num_chunks": len(email_chunks)
     }
+
+@app.post("/api/open-email-local/{email_id}")
+async def open_email_local(email_id: str):
+    """Open email in Apple Mail by finding and opening the .emlx file"""
+    logger.info(f"=== API REQUEST: open-email-local/{email_id} ===")
+    logger.info(f"System platform: {platform.system()}")
+    
+    if not is_macos():
+        logger.error("Request made on non-macOS system")
+        raise HTTPException(status_code=400, detail="Local email opening only available on macOS")
+    
+    if not has_apple_mail():
+        logger.error("Apple Mail not found on system")
+        raise HTTPException(status_code=400, detail="Apple Mail not found on this system")
+    
+    logger.info(f"System checks passed, attempting to open email...")
+    result = open_email_in_apple_mail(email_id)
+    
+    logger.info(f"Apple Mail integration result: {result}")
+    
+    if not result["success"]:
+        logger.error(f"Failed to open email: {result['message']}")
+        raise HTTPException(status_code=404, detail=result["message"])
+    
+    logger.info(f"Successfully processed request for email {email_id}")
+    return result
+
+@app.post("/api/open-privacy-settings")
+async def open_privacy_settings_endpoint():
+    """Open macOS Privacy & Security settings to help user grant permissions"""
+    if not is_macos():
+        raise HTTPException(status_code=400, detail="Privacy settings only available on macOS")
+    
+    success = open_privacy_settings()
+    
+    if success:
+        return {"success": True, "message": "Privacy settings opened"}
+    else:
+        return {"success": False, "message": "Failed to open privacy settings"}
 
 if __name__ == "__main__":
     print("Starting SmartMail Visualization Server...")

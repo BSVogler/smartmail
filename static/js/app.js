@@ -3,6 +3,25 @@ let currentData = null;
 let currentChart = null;
 let statusCheckInterval = null;
 let selectedClusterId = null;
+let systemInfo = null;
+
+// Check system information
+async function checkSystemInfo() {
+    try {
+        const response = await fetch('/api/system-info');
+        systemInfo = await response.json();
+        console.log('System info:', systemInfo);
+        updateSystemDisplay();
+    } catch (error) {
+        console.error('System info check failed:', error);
+        systemInfo = {
+            is_macos: false,
+            has_apple_mail: false,
+            can_open_local_emails: false,
+            platform: 'unknown'
+        };
+    }
+}
 
 // Check application status
 async function checkStatus() {
@@ -63,6 +82,35 @@ function getDetailedStatusTooltip(status) {
     parts.push(`Data: ${status.has_data ? `${status.total_chunks} chunks` : 'No data'}`);
     
     return parts.join('\n');
+}
+
+// Update system display with macOS/Apple Mail info
+function updateSystemDisplay() {
+    if (!systemInfo) return;
+    
+    const statusText = document.querySelector('.status-text');
+    const statusIndicator = document.getElementById('status-indicator');
+    
+    // Update tooltip to include system info
+    let systemTooltip = '';
+    if (systemInfo.is_macos) {
+        systemTooltip += `Platform: macOS\n`;
+        if (systemInfo.has_apple_mail) {
+            systemTooltip += `Apple Mail: Available\n`;
+            systemTooltip += `Local emails: ${systemInfo.can_open_local_emails ? 'Supported' : 'Not supported'}`;
+        } else if (systemInfo.permission_issue) {
+            systemTooltip += `Apple Mail: Permission Required\n`;
+            systemTooltip += `${systemInfo.mail_access_note}`;
+        } else {
+            systemTooltip += `Apple Mail: Not found`;
+        }
+    } else {
+        systemTooltip += `Platform: ${systemInfo.platform}\nApple Mail: Not available`;
+    }
+    
+    // Add system info to existing tooltip
+    const existingTooltip = statusIndicator.title || '';
+    statusIndicator.title = existingTooltip + (existingTooltip ? '\n\n' : '') + systemTooltip;
 }
 
 // Toggle detailed status view
@@ -948,9 +996,17 @@ function updateEmailList(data, filteredClusterId = null) {
         const preview = email.email_preview || 'No preview available';
         const shortPreview = preview.length > 120 ? preview.substring(0, 120) + '...' : preview;
         
+        // Add Apple Mail button if available
+        const appleMailButton = (systemInfo && systemInfo.can_open_local_emails) 
+            ? `<button class="apple-mail-btn" onclick="event.stopPropagation(); openEmailInAppleMail('${email.email_id}')" title="Open in Apple Mail">📧</button>`
+            : '';
+        
         emailsHtml += `
             <div class="email-item ${unreadClass}" data-email-id="${email.email_id}" onclick="selectEmail('${email.email_id}')">
-                <div class="email-subject">${unreadIndicator}${email.subject || 'No Subject'}</div>
+                <div class="email-item-header">
+                    <div class="email-subject">${unreadIndicator}${email.subject || 'No Subject'}</div>
+                    ${appleMailButton}
+                </div>
                 <div class="email-from">From: ${email.from || 'Unknown Sender'}</div>
                 <div class="email-date">${formatEmailDate(email.date)}</div>
                 <div class="email-preview">${shortPreview}</div>
@@ -1110,7 +1166,8 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
     
-    // Initial status check
+    // Initial checks
+    checkSystemInfo();
     checkStatus();
     
     // Auto-load data when page opens
@@ -1192,6 +1249,78 @@ function closeEmailViewer() {
     // Restore chart container to full height
     const chartContainer = document.getElementById('chart-container');
     chartContainer.style.flex = '2';
+}
+
+// Open email in Apple Mail (macOS only)
+async function openEmailInAppleMail(emailId) {
+    if (!systemInfo) {
+        alert('System information not available');
+        return;
+    }
+    
+    if (!systemInfo.is_macos) {
+        alert('Apple Mail integration only available on macOS');
+        return;
+    }
+    
+    if (systemInfo.permission_issue) {
+        if (confirm(`Apple Mail integration requires permission.\n\nTo enable:\n1. Open System Preferences → Privacy & Security\n2. Go to 'Full Disk Access'\n3. Add your terminal/IDE to the list\n4. Restart the SmartMail server\n\nWould you like to open Privacy Settings now?`)) {
+            openPrivacySettings();
+        }
+        return;
+    }
+    
+    if (!systemInfo.can_open_local_emails) {
+        alert('Apple Mail integration not available on this system');
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/open-email-local/${emailId}`, {
+            method: 'POST'
+        });
+        
+        const result = await response.json();
+        
+        if (!response.ok) {
+            throw new Error(result.detail || 'Failed to open email');
+        }
+        
+        console.log('Email opened in Apple Mail:', result.message);
+        
+    } catch (error) {
+        console.error('Error opening email in Apple Mail:', error);
+        
+        if (error.message.includes('Permission') || error.message.includes('Operation not permitted')) {
+            if (confirm(`Permission Error: SmartMail needs access to Apple Mail data.\n\nTo fix this:\n1. Open System Preferences → Privacy & Security\n2. Go to 'Full Disk Access'\n3. Add your terminal/IDE to the list\n4. Restart SmartMail\n\nWould you like to open Privacy Settings now?\n\nError: ${error.message}`)) {
+                openPrivacySettings();
+            }
+        } else {
+            alert(`Failed to open email in Apple Mail: ${error.message}`);
+        }
+    }
+}
+
+// Open macOS Privacy Settings
+async function openPrivacySettings() {
+    try {
+        const response = await fetch('/api/open-privacy-settings', {
+            method: 'POST'
+        });
+        
+        const result = await response.json();
+        
+        if (response.ok && result.success) {
+            console.log('Privacy settings opened successfully');
+        } else {
+            console.error('Failed to open privacy settings:', result.message);
+            alert('Could not open Privacy Settings automatically. Please open System Preferences manually.');
+        }
+        
+    } catch (error) {
+        console.error('Error opening privacy settings:', error);
+        alert('Could not open Privacy Settings automatically. Please open System Preferences manually.');
+    }
 }
 
 // Add double-click handler to email items

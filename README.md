@@ -61,3 +61,15 @@ The script will:
 6. Launch interactive search interface
 
 Type natural language queries to find relevant emails. The system uses semantic similarity to find related content even if exact words don't match.
+
+# Planned features
+Starting for private use cases.
+
+- Auto categorization (moves mails into folders based on semantic similarity)
+- Automatic Diary (summaize what is going on in your life)
+  - MCP server for other LLMs to access it
+- Summarize informative emails
+- For urgent mails inform via telegram bot
+- Track spendings/bills and reference them in emails
+- only keep the latest e-mail for parcel tracing updates
+- MCP server to allow other LLMs to access specific emails (like a folder)

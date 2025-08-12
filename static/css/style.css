@@ -225,6 +225,31 @@ body {
     font-weight: 700;
 }
 
+.email-item-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 2px;
+}
+
+.apple-mail-btn {
+    background: none;
+    border: none;
+    font-size: 12px;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 3px;
+    transition: background-color 0.15s;
+    flex-shrink: 0;
+    margin-left: 8px;
+    opacity: 0.6;
+}
+
+.apple-mail-btn:hover {
+    background-color: rgba(0, 102, 204, 0.1);
+    opacity: 1;
+}
+
 .email-from {
     font-size: 11px;
     color: #6c757d;
