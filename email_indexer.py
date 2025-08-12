@@ -37,6 +37,7 @@ class EmailIndexer:
         print(f"Configuration:")
         print(f"  IMAP Server: {self.imap_server}:{self.imap_port}")
         print(f"  Email: {self.email_address}")
+        print(f"  Apple Mailbox: {os.getenv('APPLE_MAILBOX', 'auto-detect')} (for macOS integration)")
         print(f"  Infinity URL: {self.infinity_url} (optional)")
         print(f"  Local fallback model: {self.local_model_name} (loaded only if needed)")
         
