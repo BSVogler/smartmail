@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SmartMail - Email Clustering Visualization</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-left">
+                <span class="app-icon">📧</span>
+                <h1>SmartMail</h1>
+            </div>
+            <div class="header-right">
+                <div class="search-container">
+                    <input type="text" id="search-input" placeholder="🔍 Search emails..." class="header-search">
+                </div>
+                <span class="subtitle">Email Clustering & Semantic Search</span>
+            </div>
+        </div>
+        
+        <div class="main-content">
+            <div class="sidebar" id="sidebar">
+                <div class="toolbar">
+                    <button class="btn" onclick="refreshMails()" id="refresh-mails-btn" disabled>📨 Refresh Mails</button>
+                    <button class="btn" onclick="reindexEmails()" id="reindex-btn" disabled>📧 Reindex All</button>
+                </div>
+                
+                <div class="sidebar-content">
+                    
+                    <div class="progress-container" id="progress-container" style="display: none; background: white; padding: 12px; border-radius: 8px; border: 1px solid #e9ecef;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <span id="progress-text" style="font-size: 13px; color: #2c3e50;">Initializing...</span>
+                            <span id="progress-percent" style="font-size: 11px; color: #6c757d;">0%</span>
+                        </div>
+                        <div class="progress-bar" style="width: 100%; height: 6px; background: #f8f9fa; border-radius: 3px; overflow: hidden;">
+                            <div id="progress-fill" style="height: 100%; background: linear-gradient(90deg, #0066cc, #0052a3); width: 0%; transition: width 0.3s ease; border-radius: 3px;"></div>
+                        </div>
+                    </div>
+                    
+                    <div id="search-results-container" style="display: none;">
+                        <div class="search-results-header">
+                            <h4 style="margin: 0 0 8px 0; font-size: 13px; color: #2c3e50;">Search Results</h4>
+                            <button class="btn-small" onclick="clearSearchResults()" style="font-size: 10px; padding: 4px 8px;">Clear</button>
+                        </div>
+                        <div id="search-results-list">
+                            <!-- Search results will appear here -->
+                        </div>
+                    </div>
+                    
+                    <div class="clustering-params" id="clustering-params" style="background: white; padding: 12px; border-radius: 8px; margin-bottom: 16px; border: 1px solid #e9ecef; display: none;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <h4 style="margin: 0; font-size: 13px; color: #2c3e50;">Clustering Parameters</h4>
+                            <div class="clustering-spinner" id="clustering-spinner" style="display: none;">
+                                <div class="spinner"></div>
+                                <span style="font-size: 11px; color: #6c757d; margin-left: 8px;">Recalculating...</span>
+                            </div>
+                        </div>
+                        
+                        <div class="control-group" style="margin-bottom: 8px;">
+                            <label for="clustering-method">Method:</label>
+                            <select id="clustering-method">
+                                <option value="kmeans">K-means</option>
+                                <option value="dbscan" selected>DBSCAN</option>
+                            </select>
+                        </div>
+                        
+                        <div class="control-group" style="margin-bottom: 8px;">
+                            <label for="eps-param">Similarity Threshold (eps):</label>
+                            <input type="range" id="eps-param" min="0.01" max="1.0" step="0.01" value="0.25">
+                            <span id="eps-value" style="font-size: 11px; color: #6c757d;">0.25</span>
+                        </div>
+                        
+                        <div class="control-group" style="margin-bottom: 8px;">
+                            <label for="min-samples">Min emails per cluster:</label>
+                            <input type="range" id="min-samples" min="2" max="8" step="1" value="2">
+                            <span id="min-samples-value" style="font-size: 11px; color: #6c757d;">2</span>
+                        </div>
+                        
+                        <div class="control-group" style="margin-bottom: 8px;">
+                            <label for="spread-param">Visual spread:</label>
+                            <input type="range" id="spread-param" min="0.2" max="1.5" step="0.1" value="0.4">
+                            <span id="spread-value" style="font-size: 11px; color: #6c757d;">0.4</span>
+                        </div>
+                    </div>
+                    
+                    <div class="clusters-list" id="clusters-container">
+                        <div class="loading">Clusters will appear here</div>
+                    </div>
+                    
+                    <div class="email-list-section" id="email-list-section">
+                        <div class="email-list-header">
+                            <h4 style="margin: 0; font-size: 13px; color: #2c3e50;">Email List</h4>
+                            <button class="btn-small" onclick="clearEmailFilter()" id="clear-filter-btn" style="display: none;">
+                                Clear Filter
+                            </button>
+                        </div>
+                        <div class="email-list" id="email-list">
+                            <div class="loading">Emails will appear here</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="splitter" id="splitter"></div>
+            
+            <div class="right-panel">
+                <div class="chart-container" id="chart-container">
+                    <div id="chart">
+                        <div class="loading">
+                            <h3>Loading SmartMail</h3>
+                            <p>Initializing email clustering visualization...</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="email-viewer" id="email-viewer" style="display: none;">
+                    <div class="email-viewer-header">
+                        <h4 id="email-viewer-subject">Email Subject</h4>
+                        <button class="btn-small" onclick="closeEmailViewer()">&times;</button>
+                    </div>
+                    <div class="email-viewer-meta">
+                        <div class="email-meta-row">
+                            <strong>From:</strong> <span id="email-viewer-from"></span>
+                        </div>
+                        <div class="email-meta-row">
+                            <strong>Date:</strong> <span id="email-viewer-date"></span>
+                        </div>
+                    </div>
+                    <div class="email-viewer-content" id="email-viewer-content">
+                        Email content will appear here
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Bottom left status indicator -->
+        <div class="status-overlay" id="status-overlay">
+            <div class="status-indicator-collapsed" id="status-indicator" onclick="toggleStatusDetails()">
+                <span class="status-text">Checking...</span>
+            </div>
+            <div class="status-details" id="status-details" style="display: none;">
+                <!-- Detailed status will appear here -->
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

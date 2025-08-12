@@ -16,7 +16,7 @@ import time
 import pickle
 from sklearn.cluster import KMeans, DBSCAN
 from sklearn.preprocessing import StandardScaler
-import umap
+import umap.umap_ as umap
 
 load_dotenv()
 
@@ -54,7 +54,9 @@ class EmailIndexer:
         self.infinity_available = self.check_infinity_server()
         
         # Clustering and visualization
-        self.embeddings_array = None
+        self.embeddings_array = None  # Chunk-level embeddings
+        self.email_embeddings = None  # Email-level embeddings (averaged)
+        self.email_metadata = None    # One entry per email
         self.clusters = None
         self.coordinates_2d = None
         self.cluster_labels = None
@@ -102,28 +104,55 @@ class EmailIndexer:
                 if i % 10 == 0:
                     print(f"Decoding email {i+1}/{len(email_ids)}...")
                 
-                _, msg_data = self.mail.fetch(email_id, '(RFC822)')
+                # Fetch message content without marking as read
+                _, msg_data = self.mail.fetch(email_id, '(BODY.PEEK[])')
                 
+                # Fetch flags separately to be sure we get them
+                _, flag_data = self.mail.fetch(email_id, '(FLAGS)')
+                
+                # Parse message data
+                message_data = None
                 for response_part in msg_data:
                     if isinstance(response_part, tuple):
-                        msg = email.message_from_bytes(response_part[1])
-                        
-                        subject = self.decode_header_value(msg['Subject'])
-                        from_addr = self.decode_header_value(msg['From'])
-                        date = msg['Date']
-                        
-                        body = self.extract_body(msg)
-                        
-                        email_data = {
-                            'id': email_id.decode(),
-                            'subject': subject,
-                            'from': from_addr,
-                            'date': date,
-                            'body': body,
-                            'full_content': f"From: {from_addr}\nDate: {date}\nSubject: {subject}\n\n{body}"
-                        }
-                        
-                        emails.append(email_data)
+                        message_data = response_part[1]
+                        break
+                
+                # Parse flags data
+                flags_str = ""
+                for response_part in flag_data:
+                    if isinstance(response_part, bytes):
+                        flags_str = response_part.decode('utf-8', errors='ignore')
+                        break
+                
+                if message_data:
+                    msg = email.message_from_bytes(message_data)
+                    
+                    subject = self.decode_header_value(msg['Subject'])
+                    from_addr = self.decode_header_value(msg['From'])
+                    date = msg['Date']
+                    
+                    body = self.extract_body(msg)
+                    
+                    # Determine if email is unread (doesn't have SEEN flag)
+                    is_unread = True
+                    if flags_str and '\\Seen' in flags_str:
+                        is_unread = False
+                    
+                    # Debug logging for flags
+                    if i < 3:  # Only log first 3 emails to avoid spam
+                        print(f"Email {i+1}: flags = '{flags_str}', is_unread = {is_unread}")
+                    
+                    email_data = {
+                        'id': email_id.decode(),
+                        'subject': subject,
+                        'from': from_addr,
+                        'date': date,
+                        'body': body,
+                        'full_content': f"From: {from_addr}\nDate: {date}\nSubject: {subject}\n\n{body}",
+                        'is_unread': is_unread
+                    }
+                    
+                    emails.append(email_data)
             
             print(f"Successfully fetched {len(emails)} emails")
             return emails
@@ -211,7 +240,8 @@ class EmailIndexer:
                         'from': email_data['from'],
                         'date': email_data['date'],
                         'chunk_index': chunk_idx,
-                        'total_chunks': len(chunks)
+                        'total_chunks': len(chunks),
+                        'is_unread': email_data.get('is_unread', False)
                     })
             except Exception as e:
                 print(f"Error chunking email {email_data['id']}: {e}")
@@ -222,7 +252,8 @@ class EmailIndexer:
                     'from': email_data['from'],
                     'date': email_data['date'],
                     'chunk_index': 0,
-                    'total_chunks': 1
+                    'total_chunks': 1,
+                    'is_unread': email_data.get('is_unread', False)
                 })
         
         print(f"Created {len(all_chunks)} chunks from {len(emails)} emails")
@@ -359,6 +390,7 @@ class EmailIndexer:
         
         self.embeddings_array = embeddings
         self.build_index(embeddings)
+        self.aggregate_email_embeddings()
         self.perform_clustering()
         self.generate_2d_coordinates()
         
@@ -407,30 +439,107 @@ class EmailIndexer:
         
         print("\nGoodbye!")
     
-    def perform_clustering(self, n_clusters: Optional[int] = None):
-        """Perform clustering on the embeddings"""
-        if self.embeddings_array is None:
-            print("No embeddings available for clustering")
+    def aggregate_email_embeddings(self):
+        """Aggregate chunk embeddings into email-level embeddings by averaging"""
+        if self.embeddings_array is None or not self.chunk_metadata:
+            print("No embeddings or metadata available for aggregation")
             return
         
-        print("Performing clustering analysis...")
+        print("Aggregating embeddings by email...")
+        
+        # Group chunks by email_id
+        email_groups = {}
+        for i, metadata in enumerate(self.chunk_metadata):
+            email_id = metadata['email_id']
+            if email_id not in email_groups:
+                email_groups[email_id] = {
+                    'chunk_indices': [],
+                    'metadata': metadata  # Use first chunk's metadata for email
+                }
+            email_groups[email_id]['chunk_indices'].append(i)
+        
+        # Create email-level embeddings and metadata
+        email_embeddings = []
+        email_metadata = []
+        
+        for email_id, group_data in email_groups.items():
+            chunk_indices = group_data['chunk_indices']
+            
+            # Average the embeddings for all chunks of this email
+            email_embedding = np.mean(self.embeddings_array[chunk_indices], axis=0)
+            email_embeddings.append(email_embedding)
+            
+            # Create email-level metadata
+            chunks_preview = []
+            for idx in chunk_indices:
+                chunk_text = self.email_chunks[idx][:100]  # First 100 chars of each chunk
+                chunks_preview.append(chunk_text)
+            
+            combined_preview = " | ".join(chunks_preview)[:500] + "..." if len(" | ".join(chunks_preview)) > 500 else " | ".join(chunks_preview)
+            
+            email_meta = {
+                'email_id': email_id,
+                'subject': group_data['metadata']['subject'],
+                'from': group_data['metadata']['from'],
+                'date': group_data['metadata']['date'],
+                'num_chunks': len(chunk_indices),
+                'combined_preview': combined_preview,
+                'chunk_indices': chunk_indices,  # Keep reference to original chunks
+                'is_unread': group_data['metadata'].get('is_unread', False)
+            }
+            email_metadata.append(email_meta)
+        
+        self.email_embeddings = np.array(email_embeddings)
+        self.email_metadata = email_metadata
+        
+        print(f"Created {len(email_metadata)} email-level embeddings from {len(self.email_chunks)} chunks")
+    
+    def perform_clustering(self, n_clusters: Optional[int] = None, clustering_method: str = 'dbscan', 
+                         eps: float = 0.25, min_samples: int = 2):
+        """Perform clustering on email-level embeddings with tunable parameters"""
+        if self.email_embeddings is None:
+            print("No email embeddings available for clustering")
+            return
+        
+        print("Performing clustering analysis on emails...")
+        
+        # Normalize embeddings first for better clustering
+        scaler = StandardScaler()
+        normalized_embeddings = scaler.fit_transform(self.email_embeddings)
         
         # Determine optimal number of clusters if not specified
         if n_clusters is None:
-            n_chunks = len(self.email_chunks)
-            n_clusters = min(max(3, n_chunks // 10), 15)  # 3-15 clusters based on data size
+            n_emails = len(self.email_metadata)
+            # Allow more clusters for better granularity
+            n_clusters = min(max(3, n_emails // 4), n_emails // 2)  # Up to half the emails as separate clusters
         
-        # K-means clustering
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        kmeans_labels = kmeans.fit_predict(self.embeddings_array)
+        # K-means clustering on normalized embeddings
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=20, max_iter=300)
+        kmeans_labels = kmeans.fit_predict(normalized_embeddings)
         
-        # DBSCAN clustering for comparison
-        # Normalize embeddings for DBSCAN
-        scaler = StandardScaler()
-        normalized_embeddings = scaler.fit_transform(self.embeddings_array)
+        # DBSCAN clustering with tighter parameters for more cohesive clusters
+        dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine')
+        dbscan_labels = dbscan.fit_predict(self.email_embeddings)  # Use original embeddings for cosine
         
-        dbscan = DBSCAN(eps=0.5, min_samples=2)
-        dbscan_labels = dbscan.fit_predict(normalized_embeddings)
+        # Count DBSCAN clusters (excluding noise cluster -1)
+        dbscan_n_clusters = len(set(dbscan_labels)) - (1 if -1 in dbscan_labels else 0)
+        print(f"DBSCAN with eps={eps}, min_samples={min_samples} produced {dbscan_n_clusters} clusters")
+        
+        # If DBSCAN produces too few clusters, try progressively looser parameters
+        original_eps = eps
+        attempts = 0
+        max_attempts = 3
+        
+        while dbscan_n_clusters < 2 and attempts < max_attempts:
+            attempts += 1
+            new_eps = eps * (1.5 ** attempts)  # Exponentially increase eps
+            new_min_samples = max(1, min_samples - attempts)  # Decrease min_samples
+            
+            print(f"DBSCAN attempt {attempts}: trying eps={new_eps:.3f}, min_samples={new_min_samples}")
+            dbscan_retry = DBSCAN(eps=new_eps, min_samples=new_min_samples, metric='cosine')
+            dbscan_labels = dbscan_retry.fit_predict(self.email_embeddings)
+            dbscan_n_clusters = len(set(dbscan_labels)) - (1 if -1 in dbscan_labels else 0)
+            print(f"DBSCAN attempt {attempts} result: {dbscan_n_clusters} clusters")
         
         # Store clustering results
         self.clusters = {
@@ -441,78 +550,162 @@ class EmailIndexer:
             },
             'dbscan': {
                 'labels': dbscan_labels,
-                'n_clusters': len(set(dbscan_labels)) - (1 if -1 in dbscan_labels else 0)
+                'n_clusters': dbscan_n_clusters,
+                'eps': eps,
+                'min_samples': min_samples
             }
         }
         
-        self.cluster_labels = kmeans_labels  # Use K-means as default
+        # Choose clustering method based on user preference and results
+        if clustering_method == 'dbscan':
+            if dbscan_n_clusters >= 1:  # Accept even 1 cluster if user wants DBSCAN
+                self.cluster_labels = dbscan_labels
+                print(f"✓ Using DBSCAN: {dbscan_n_clusters} clusters + noise points")
+            else:
+                print(f"⚠ DBSCAN failed completely, falling back to K-means")
+                self.cluster_labels = kmeans_labels
+                print(f"✓ Using K-means fallback: {n_clusters} clusters")
+        else:  # kmeans selected
+            self.cluster_labels = kmeans_labels
+            print(f"✓ Using K-means: {n_clusters} clusters")
         
-        print(f"K-means clustering: {n_clusters} clusters")
-        print(f"DBSCAN clustering: {self.clusters['dbscan']['n_clusters']} clusters")
+        # Show final cluster distribution
+        unique_labels, counts = np.unique(self.cluster_labels, return_counts=True)
+        cluster_distribution = dict(zip(unique_labels, counts))
+        print(f"Final cluster distribution: {cluster_distribution}")
     
-    def generate_2d_coordinates(self):
-        """Generate 2D coordinates using UMAP for visualization"""
-        if self.embeddings_array is None:
-            print("No embeddings available for 2D projection")
+    def generate_2d_coordinates(self, n_neighbors: int = None, min_dist: float = 0.0, 
+                               spread: float = 0.5):
+        """Generate 2D coordinates using UMAP for visualization with much tighter clustering"""
+        if self.email_embeddings is None:
+            print("No email embeddings available for 2D projection")
             return
         
-        print("Generating 2D coordinates using UMAP...")
+        print("Generating 2D coordinates using UMAP on email embeddings...")
         
-        # Use UMAP for dimensionality reduction
+        # Use UMAP for dimensionality reduction with very tight visualization parameters
+        if n_neighbors is None:
+            n_neighbors = min(5, len(self.email_embeddings) - 1)  # Very few neighbors for tight clusters
+        
         reducer = umap.UMAP(
-            n_neighbors=15,
-            min_dist=0.1,
+            n_neighbors=max(2, n_neighbors),
+            min_dist=min_dist,      # 0.0 = points can be touching
+            spread=spread,          # 0.5 = much tighter clusters in 2D
             n_components=2,
             random_state=42,
-            metric='cosine'
+            metric='cosine',
+            n_epochs=1000,          # More epochs for better cluster separation
+            learning_rate=0.5,      # Slower learning for stable clusters
+            negative_sample_rate=10, # More negative sampling for better separation
+            repulsion_strength=2.0, # Stronger repulsion between different clusters
+            a=None,                 # Let UMAP calculate optimal curve parameters
+            b=None
         )
         
-        self.coordinates_2d = reducer.fit_transform(self.embeddings_array)
+        self.coordinates_2d = reducer.fit_transform(self.email_embeddings)
         
-        print("2D coordinates generated successfully")
+        print(f"2D coordinates generated successfully for emails (n_neighbors={n_neighbors}, min_dist={min_dist}, spread={spread})")
+        
+        # Post-process to enhance cluster separation
+        self._enhance_cluster_separation()
+    
+    def _enhance_cluster_separation(self):
+        """Post-process 2D coordinates to enhance visual cluster separation"""
+        if self.coordinates_2d is None or self.cluster_labels is None:
+            return
+        
+        print("Enhancing cluster separation in 2D visualization...")
+        
+        # Calculate cluster centers in 2D space
+        cluster_centers = {}
+        for label in np.unique(self.cluster_labels):
+            if label == -1:  # Skip noise points (DBSCAN outliers)
+                continue
+            cluster_mask = self.cluster_labels == label
+            cluster_coords = self.coordinates_2d[cluster_mask]
+            cluster_centers[label] = np.mean(cluster_coords, axis=0)
+        
+        # Move clusters apart while keeping internal structure
+        if len(cluster_centers) > 1:
+            # Calculate pairwise distances between cluster centers
+            center_positions = np.array(list(cluster_centers.values()))
+            
+            # Find minimum distance between cluster centers
+            min_distance = float('inf')
+            for i in range(len(center_positions)):
+                for j in range(i + 1, len(center_positions)):
+                    dist = np.linalg.norm(center_positions[i] - center_positions[j])
+                    min_distance = min(min_distance, dist)
+            
+            # If clusters are too close, spread them out more
+            if min_distance < 3.0:  # Threshold for minimum cluster separation
+                expansion_factor = 3.0 / min_distance
+                
+                # Expand from the overall center
+                overall_center = np.mean(self.coordinates_2d, axis=0)
+                
+                for label in cluster_centers.keys():
+                    cluster_mask = self.cluster_labels == label
+                    
+                    # Move cluster center away from overall center
+                    center_offset = cluster_centers[label] - overall_center
+                    new_center = overall_center + center_offset * expansion_factor
+                    
+                    # Apply the same transformation to all points in the cluster
+                    cluster_coords = self.coordinates_2d[cluster_mask]
+                    relative_positions = cluster_coords - cluster_centers[label]
+                    self.coordinates_2d[cluster_mask] = new_center + relative_positions
+                
+                print(f"Enhanced cluster separation with expansion factor {expansion_factor:.2f}")
     
     def get_visualization_data(self) -> Dict:
-        """Get data formatted for visualization"""
-        if not all([self.coordinates_2d is not None, self.cluster_labels is not None]):
-            return {"error": "Clustering and 2D coordinates not available"}
+        """Get data formatted for visualization - one point per email"""
+        if not all([self.coordinates_2d is not None, self.cluster_labels is not None, self.email_metadata is not None]):
+            return {"error": "Email clustering and 2D coordinates not available"}
         
         data_points = []
         
-        for i, (coord, cluster, metadata, chunk) in enumerate(zip(
+        for i, (coord, cluster, email_meta) in enumerate(zip(
             self.coordinates_2d, 
             self.cluster_labels, 
-            self.chunk_metadata, 
-            self.email_chunks
+            self.email_metadata
         )):
             data_points.append({
-                'id': i,
-                'x': float(coord[0]),
-                'y': float(coord[1]),
-                'cluster': int(cluster),
-                'subject': metadata['subject'],
-                'from': metadata['from'],
-                'date': metadata['date'],
-                'chunk_preview': chunk[:200] + "..." if len(chunk) > 200 else chunk,
-                'email_id': metadata['email_id']
+                'id': int(i),
+                'x': float(coord[0]) if coord[0] is not None else 0.0,
+                'y': float(coord[1]) if coord[1] is not None else 0.0,
+                'cluster': int(cluster) if cluster is not None else 0,
+                'subject': str(email_meta['subject']) if email_meta['subject'] else '',
+                'from': str(email_meta['from']) if email_meta['from'] else '',
+                'date': str(email_meta['date']) if email_meta['date'] else '',
+                'email_preview': str(email_meta['combined_preview']),
+                'email_id': str(email_meta['email_id']),
+                'num_chunks': int(email_meta['num_chunks']),
+                'is_unread': bool(email_meta.get('is_unread', False))
             })
         
         # Calculate cluster statistics
         cluster_stats = {}
-        unique_clusters = set(self.cluster_labels)
+        # Convert numpy types to native Python types
+        unique_clusters = [int(c) for c in set(self.cluster_labels)]
         
         for cluster_id in unique_clusters:
             cluster_points = [p for p in data_points if p['cluster'] == cluster_id]
-            cluster_stats[cluster_id] = {
-                'size': len(cluster_points),
-                'emails': list(set(p['email_id'] for p in cluster_points)),
-                'common_words': self._extract_common_words([p['chunk_preview'] for p in cluster_points])
+            # Extract keywords from email previews
+            email_previews = [p['email_preview'] for p in cluster_points]
+            cluster_stats[int(cluster_id)] = {
+                'size': int(len(cluster_points)),
+                'emails': [str(p['email_id']) for p in cluster_points],
+                'common_words': self._extract_common_words(email_previews),
+                'subjects': [p['subject'] for p in cluster_points[:3]]  # Show first 3 subjects
             }
         
         return {
             'points': data_points,
             'clusters': cluster_stats,
-            'total_chunks': len(data_points),
-            'total_clusters': len(unique_clusters)
+            'total_emails': int(len(data_points)),
+            'total_chunks': int(len(self.email_chunks)) if self.email_chunks else 0,
+            'total_clusters': int(len(unique_clusters))
         }
     
     def _extract_common_words(self, texts: List[str], top_n: int = 5) -> List[str]:
@@ -540,6 +733,8 @@ class EmailIndexer:
             'email_chunks': self.email_chunks,
             'chunk_metadata': self.chunk_metadata,
             'embeddings_array': self.embeddings_array,
+            'email_embeddings': self.email_embeddings,
+            'email_metadata': self.email_metadata,
             'clusters': self.clusters,
             'coordinates_2d': self.coordinates_2d,
             'cluster_labels': self.cluster_labels
@@ -559,13 +754,23 @@ class EmailIndexer:
             self.email_chunks = data['email_chunks']
             self.chunk_metadata = data['chunk_metadata']
             self.embeddings_array = data['embeddings_array']
+            
+            # Load email-level data (backward compatibility)
+            self.email_embeddings = data.get('email_embeddings', None)
+            self.email_metadata = data.get('email_metadata', None)
+            
             self.clusters = data['clusters']
             self.coordinates_2d = data['coordinates_2d']
             self.cluster_labels = data['cluster_labels']
             
-            # Rebuild FAISS index
+            # Rebuild FAISS index for chunk-level search
             if self.embeddings_array is not None:
                 self.build_index(self.embeddings_array)
+            
+            # If email-level data is missing, regenerate it
+            if self.email_embeddings is None and self.embeddings_array is not None:
+                print("Regenerating email-level embeddings from loaded data...")
+                self.aggregate_email_embeddings()
             
             print(f"Data loaded from {filepath}")
             return True
