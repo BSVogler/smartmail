@@ -6,19 +6,20 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 from email_indexer import EmailIndexer
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, AsyncGenerator
 import json
-
-app = FastAPI(title="SmartMail Visualization", version="1.0.0")
+from contextlib import asynccontextmanager
 
 # Global indexer instance
 indexer = None
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the email indexer on startup"""
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Manage application lifespan - startup and shutdown"""
+    # Startup
     global indexer
     try:
+        print("Starting SmartMail application...")
         indexer = EmailIndexer()
         
         # Try to load existing data first
@@ -32,6 +33,18 @@ async def startup_event():
             
     except Exception as e:
         print(f"Error initializing indexer: {e}")
+    
+    yield
+    
+    # Shutdown
+    print("Shutting down SmartMail application...")
+    # Add any cleanup code here if needed
+
+app = FastAPI(
+    title="SmartMail Visualization", 
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
