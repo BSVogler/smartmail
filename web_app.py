@@ -266,10 +266,30 @@ async def index():
                 
                 try {
                     const response = await fetch('/api/emails');
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    
                     const data = await response.json();
                     
                     if (data.error) {
                         showError(data.error);
+                        // Still enable reindex button if there's an error
+                        reindexBtn.disabled = false;
+                        return;
+                    }
+                    
+                    // Validate data structure
+                    if (!data.points || !Array.isArray(data.points)) {
+                        showError('Invalid data format received from server');
+                        reindexBtn.disabled = false;
+                        return;
+                    }
+                    
+                    if (data.points.length === 0) {
+                        showError('No email data found. Click "Reindex Emails" to fetch your emails.');
+                        reindexBtn.disabled = false;
                         return;
                     }
                     
@@ -281,7 +301,9 @@ async def index():
                     reindexBtn.disabled = false;
                     
                 } catch (error) {
+                    console.error('Load data error:', error);
                     showError('Failed to load email data: ' + error.message);
+                    reindexBtn.disabled = false;
                 } finally {
                     loadBtn.textContent = '🔄 Reload Data';
                     loadBtn.disabled = false;
@@ -350,14 +372,23 @@ async def index():
             function updateClusters(data) {
                 const clustersContainer = document.getElementById('clusters-container');
                 
+                if (!data.clusters || Object.keys(data.clusters).length === 0) {
+                    clustersContainer.innerHTML = '<div class="loading">No clusters found</div>';
+                    return;
+                }
+                
                 let clustersHtml = '';
                 Object.entries(data.clusters).forEach(([clusterId, cluster]) => {
+                    const size = cluster.size || 0;
+                    const emailCount = cluster.emails ? cluster.emails.length : 0;
+                    const keywords = cluster.common_words || [];
+                    
                     clustersHtml += `
                         <div class="cluster-item" onclick="highlightCluster(${clusterId})">
                             <div class="cluster-id">Cluster ${clusterId}</div>
-                            <div class="cluster-size">${cluster.size} chunks • ${cluster.emails.length} emails</div>
+                            <div class="cluster-size">${size} chunks • ${emailCount} emails</div>
                             <div class="cluster-keywords">
-                                ${cluster.common_words.map(word => `<span class="keyword-tag">${word}</span>`).join('')}
+                                ${keywords.map(word => `<span class="keyword-tag">${word}</span>`).join('')}
                             </div>
                         </div>
                     `;
@@ -367,29 +398,35 @@ async def index():
             }
 
             function createVisualization(data) {
+                if (!data.points || data.points.length === 0) {
+                    document.getElementById('chart').innerHTML = '<div class="loading">No data to visualize</div>';
+                    return;
+                }
+                
                 const points = data.points;
                 
                 // Group points by cluster
                 const clusterGroups = {};
                 points.forEach(point => {
-                    if (!clusterGroups[point.cluster]) {
-                        clusterGroups[point.cluster] = [];
+                    const clusterId = point.cluster || 0; // Handle undefined cluster
+                    if (!clusterGroups[clusterId]) {
+                        clusterGroups[clusterId] = [];
                     }
-                    clusterGroups[point.cluster].push(point);
+                    clusterGroups[clusterId].push(point);
                 });
 
                 // Create traces for each cluster
                 const traces = Object.entries(clusterGroups).map(([clusterId, clusterPoints]) => ({
-                    x: clusterPoints.map(p => p.x),
-                    y: clusterPoints.map(p => p.y),
+                    x: clusterPoints.map(p => p.x || 0),
+                    y: clusterPoints.map(p => p.y || 0),
                     mode: 'markers',
                     type: 'scatter',
                     name: `Cluster ${clusterId}`,
                     text: clusterPoints.map(p => 
-                        `<b>Subject:</b> ${p.subject}<br>` +
-                        `<b>From:</b> ${p.from}<br>` +
-                        `<b>Date:</b> ${p.date}<br>` +
-                        `<b>Preview:</b> ${p.chunk_preview.substring(0, 100)}...`
+                        `<b>Subject:</b> ${p.subject || 'No subject'}<br>` +
+                        `<b>From:</b> ${p.from || 'Unknown sender'}<br>` +
+                        `<b>Date:</b> ${p.date || 'No date'}<br>` +
+                        `<b>Preview:</b> ${(p.chunk_preview || 'No preview').substring(0, 100)}...`
                     ),
                     hovertemplate: '%{text}<extra></extra>',
                     marker: {
@@ -468,12 +505,30 @@ async def index():
 async def get_emails():
     """Get all emails with clustering and 2D coordinates"""
     if indexer is None:
-        raise HTTPException(status_code=500, detail="Indexer not initialized")
+        return JSONResponse(content={"error": "Indexer not initialized"})
     
-    if indexer.coordinates_2d is None:
-        return JSONResponse(content={"error": "No email data available. Please reindex emails first."})
+    if indexer.coordinates_2d is None or indexer.cluster_labels is None or not indexer.email_chunks:
+        return JSONResponse(content={
+            "error": "No email data available. Please reindex emails first.",
+            "points": [],
+            "clusters": {},
+            "total_chunks": 0,
+            "total_clusters": 0
+        })
     
-    return indexer.get_visualization_data()
+    try:
+        data = indexer.get_visualization_data()
+        if "error" in data:
+            return JSONResponse(content=data)
+        return data
+    except Exception as e:
+        return JSONResponse(content={
+            "error": f"Failed to get visualization data: {str(e)}",
+            "points": [],
+            "clusters": {},
+            "total_chunks": 0,
+            "total_clusters": 0
+        })
 
 @app.get("/api/clusters")
 async def get_clusters():
